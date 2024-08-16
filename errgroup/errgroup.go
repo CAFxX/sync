@@ -67,23 +67,14 @@ func (g *Group) Wait() error {
 // The first call to return a non-nil error cancels the group's context, if the
 // group was created by calling WithContext. The error will be returned by Wait.
 func (g *Group) Go(f func() error) {
-	if g.sem != nil {
-		g.sem <- token{}
-	}
+	g.do(f, nil, false)
+}
 
-	g.wg.Add(1)
-	go func() {
-		defer g.done()
-
-		if err := f(); err != nil {
-			g.errOnce.Do(func() {
-				g.err = err
-				if g.cancel != nil {
-					g.cancel(g.err)
-				}
-			})
-		}
-	}()
+// GoChan is like Go, but returns a channel that is closed after f has returned.
+func (g *Group) GoChan(f func() error) <-chan struct{} {
+	ch := make(chan struct{})
+	g.do(f, ch, false)
+	return ch
 }
 
 // TryGo calls the given function in a new goroutine only if the number of
@@ -91,28 +82,53 @@ func (g *Group) Go(f func() error) {
 //
 // The return value reports whether the goroutine was started.
 func (g *Group) TryGo(f func() error) bool {
+	return g.do(f, nil, true)
+}
+
+// TryGoChan is like TryGo but, if f was started, it returns a non-nil channel like GoChan.
+func (g *Group) TryGoChan(f func() error) <-chan struct{} {
+	ch := make(chan struct{})
+	if g.do(f, ch, true) {
+		return ch
+	}
+	return nil
+}
+
+func (g *Group) do(f func() error, ch chan struct{}, nb bool) bool {
 	if g.sem != nil {
-		select {
-		case g.sem <- token{}:
-			// Note: this allows barging iff channels in general allow barging.
-		default:
-			return false
+		if nb {
+			select {
+			case g.sem <- token{}:
+				// Note: this allows barging iff channels in general allow barging.
+			default:
+				return false
+			}
+		} else {
+			g.sem <- token{}
 		}
 	}
-
+	
 	g.wg.Add(1)
 	go func() {
-		defer g.done()
+		defer func() {
+			if ch != nil {
+				// This must happen *after* the call to g.cancel, if any.
+				close(ch) 
+			}
+			g.done()
+		}()
 
 		if err := f(); err != nil {
 			g.errOnce.Do(func() {
 				g.err = err
-				if g.cancel != nil {
-					g.cancel(g.err)
+				if cancel := g.cancel; cancel != nil {
+					g.cancel = nil
+					cancel(g.err)
 				}
 			})
 		}
 	}()
+
 	return true
 }
 
